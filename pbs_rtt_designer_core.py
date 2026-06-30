@@ -56,6 +56,8 @@ class DesignResult:
     pbs_df: pd.DataFrame
     rtt_text: str
     pbs_text: str
+    rtt_pbs_text: str
+    rtt_insert_pbs_text: str
     summary_line: str
     warnings: list[str]
 
@@ -83,6 +85,19 @@ def clean_spacer(spacer: str) -> str:
 
 
 
+def validate_insertion_sequence(seq: str, allow_empty: bool = True) -> str:
+    seq = re.sub(r"\s+", "", str(seq or ""))
+    if not seq:
+        if allow_empty:
+            return ""
+        raise ValueError("Insertion sequence is empty.")
+    bad = sorted({base for base in seq if base not in "ATCGUatcgu"})
+    if bad:
+        raise ValueError(f"Insertion contains invalid character(s): {', '.join(bad)}")
+    return seq
+
+
+
 def revcomp_dna(seq: str) -> str:
     return clean_dna(seq).translate(str.maketrans("ACGT", "TGCA"))[::-1]
 
@@ -90,6 +105,11 @@ def revcomp_dna(seq: str) -> str:
 
 def dna_to_rna(seq_dna: str) -> str:
     return str(seq_dna or "").upper().replace("T", "U")
+
+
+
+def insertion_to_combo_output(seq: str) -> str:
+    return str(seq or "").replace("T", "U").replace("t", "u")
 
 
 
@@ -345,6 +365,11 @@ def format_plain_sequences(sequences: list[str]) -> str:
 
 
 
+def format_delimited_rows(rows: list[tuple[str, ...]]) -> str:
+    return "\n".join("\t".join(row) for row in rows)
+
+
+
 def design_pbs_rtt(
     genomic_seq: str,
     spacer: str,
@@ -358,12 +383,16 @@ def design_pbs_rtt(
     rtt_count: int = 3,
     rtt_start_mode: str = "selected",
     rtt_start_target: Optional[int] = None,
+    include_insertion: bool = True,
+    insertion_sequence: str = "",
 ) -> DesignResult:
     target_seq, match = get_target_sequence_and_match(
         genomic_seq=genomic_seq,
         spacer=spacer,
         nick_offset=nick_offset,
     )
+
+    insertion_sequence = validate_insertion_sequence(insertion_sequence, allow_empty=True)
 
     pbs_lengths, default_pbs_len, default_pbs_tm = pbs_lengths_from_mode(
         target_seq_dna=target_seq,
@@ -420,6 +449,22 @@ def design_pbs_rtt(
     pbs_df["Tm"] = pbs_df["Tm"].map(lambda x: round(float(x), 2))
     rtt_df = pd.DataFrame(rtt_rows).sort_values(["Length", "Sequence"]).reset_index(drop=True)
 
+    rtt_sequences = rtt_df["Sequence"].tolist()
+    pbs_sequences = pbs_df["Sequence"].tolist()
+
+    rtt_pbs_rows = [(rtt_seq, pbs_seq) for pbs_seq in pbs_sequences for rtt_seq in rtt_sequences]
+    rtt_pbs_text = format_delimited_rows(rtt_pbs_rows)
+
+    rtt_insert_pbs_text = ""
+    if include_insertion and insertion_sequence:
+        insert_for_output = insertion_to_combo_output(insertion_sequence)
+        rtt_insert_pbs_rows = [
+            (rtt_seq, insert_for_output, pbs_seq)
+            for pbs_seq in pbs_sequences
+            for rtt_seq in rtt_sequences
+        ]
+        rtt_insert_pbs_text = format_delimited_rows(rtt_insert_pbs_rows)
+
     summary_line = f"Spacer matching strand: {match.strand}; Default PBS: {default_pbs_len} nt, Tm = {round(float(default_pbs_tm), 2)} °C"
 
     return DesignResult(
@@ -429,8 +474,10 @@ def design_pbs_rtt(
         default_pbs_tm=(round(float(default_pbs_tm), 2) if default_pbs_tm is not None else None),
         rtt_df=rtt_df,
         pbs_df=pbs_df,
-        rtt_text=format_plain_sequences(rtt_df["Sequence"].tolist()),
-        pbs_text=format_plain_sequences(pbs_df["Sequence"].tolist()),
+        rtt_text=format_plain_sequences(rtt_sequences),
+        pbs_text=format_plain_sequences(pbs_sequences),
+        rtt_pbs_text=rtt_pbs_text,
+        rtt_insert_pbs_text=rtt_insert_pbs_text,
         summary_line=summary_line,
         warnings=warnings,
     )
