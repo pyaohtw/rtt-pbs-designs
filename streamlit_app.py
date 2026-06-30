@@ -5,7 +5,7 @@ from html import escape
 
 import streamlit as st
 
-from pbs_rtt_designer_core import build_rtt_start_selector, design_pbs_rtt
+from pbs_rtt_designer_core import build_rtt_start_selector, design_pbs_rtt, validate_insertion_sequence
 
 st.set_page_config(page_title="PBS/RTT Sub-tool", layout="wide")
 st.title("PBS / RTT designer")
@@ -94,6 +94,7 @@ def _selector_signature(genomic_seq: str, spacer: str, nick_offset: int) -> str:
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 
+
 def _render_selector_row(row, selected_target: int) -> str:
     cells: list[str] = []
     for base in row:
@@ -105,13 +106,15 @@ def _render_selector_row(row, selected_target: int) -> str:
         if base.target_index == selected_target:
             classes.append("selected")
         cells.append(f'<span class="{" ".join(classes)}">{escape(base.base)}</span>')
-    return '<div class="rtt-seq-row">' + "".join(cells) + '</div>'
+    return '<div class="rtt-seq-row">' + "".join(cells) + "</div>"
+
 
 
 def _offset_label(offset: int) -> str:
     if offset == 0:
         return "0"
     return f"{offset:+d}"
+
 
 
 def render_rtt_start_selector(selector, signature: str, show_buttons: bool = True) -> int:
@@ -197,6 +200,28 @@ with left_col:
         "pegRNA spacer",
         placeholder="Paste spacer here (DNA or RNA alphabet accepted).",
     )
+
+    insert_toggle_col, insert_help_col, insert_input_col = st.columns([2.2, 0.8, 7])
+    with insert_toggle_col:
+        include_insertion = st.checkbox("Include insertion", value=True)
+    with insert_help_col:
+        with st.popover("?"):
+            st.write(
+                "Optional sequence inserted between RTT and PBS in the combination output. "
+                "A/T/C/G/U in either case is accepted, case is preserved, and T/t is converted to U/u in the combo block."
+            )
+    with insert_input_col:
+        insertion_sequence = st.text_input(
+            "Insertion sequence",
+            value="aaaaggggttttcccc",
+            placeholder="Optional insertion sequence (A/T/C/G/U accepted).",
+        )
+
+    if insertion_sequence.strip():
+        try:
+            validate_insertion_sequence(insertion_sequence, allow_empty=True)
+        except ValueError as exc:
+            st.warning(str(exc))
 
 with right_col:
     st.markdown("### PBS settings")
@@ -313,6 +338,8 @@ if run:
             rtt_count=int(rtt_count),
             rtt_start_mode=("selected" if rtt_start_mode == "Selected RTT start" else "nick"),
             rtt_start_target=selected_rtt_start_target,
+            include_insertion=bool(include_insertion),
+            insertion_sequence=insertion_sequence,
         )
     except Exception as exc:
         st.error(str(exc))
@@ -333,3 +360,10 @@ if run:
             st.markdown("### PBS")
             st.code(result.pbs_text, language=None)
             st.dataframe(result.pbs_df, use_container_width=True)
+
+        st.markdown("### RTT x PBS")
+        st.code(result.rtt_pbs_text, language=None)
+
+        if result.rtt_insert_pbs_text:
+            st.markdown("### RTT x insert x PBS")
+            st.code(result.rtt_insert_pbs_text, language=None)
