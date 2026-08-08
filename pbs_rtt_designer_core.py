@@ -12,9 +12,15 @@ import pbs_tm
 PBS_MIN_LEN = 5
 PBS_MAX_LEN = 25
 TARGET_PBS_TM = 37.0
+
 RTT_SELECTOR_SPACER_CONTEXT = 10
 RTT_SELECTOR_POST_SPACER_ROW1 = 10
 RTT_SELECTOR_POST_SPACER_ROW2 = 20
+
+# Insertion orientation modes (addition mode only).
+INSERTION_ORIENTATION_AUTO = "auto"
+INSERTION_ORIENTATION_FORWARD = "forward"
+INSERTION_ORIENTATION_REVERSE = "reverse"
 
 
 @dataclass
@@ -60,7 +66,12 @@ class DesignResult:
     rtt_insert_pbs_text: str
     summary_line: str
     warnings: list[str]
-
+    # Addition-mode extras (None / defaults in legacy mode).
+    addition_mode: bool = False
+    addition_insert_rna: Optional[str] = None
+    addition_retained_dna: Optional[str] = None
+    insertion_orientation_applied: Optional[str] = None
+    detected_strand: Optional[str] = None
 
 
 def clean_dna(seq: str) -> str:
@@ -73,7 +84,6 @@ def clean_dna(seq: str) -> str:
     return seq
 
 
-
 def clean_spacer(spacer: str) -> str:
     spacer = re.sub(r"\s+", "", str(spacer or "")).upper().replace("U", "T")
     if not spacer:
@@ -82,7 +92,6 @@ def clean_spacer(spacer: str) -> str:
     if bad:
         raise ValueError(f"Spacer contains invalid character(s): {', '.join(bad)}")
     return spacer
-
 
 
 def validate_insertion_sequence(seq: str, allow_empty: bool = True) -> str:
@@ -97,25 +106,20 @@ def validate_insertion_sequence(seq: str, allow_empty: bool = True) -> str:
     return seq
 
 
-
 def revcomp_dna(seq: str) -> str:
     return clean_dna(seq).translate(str.maketrans("ACGT", "TGCA"))[::-1]
-
 
 
 def dna_to_rna(seq_dna: str) -> str:
     return str(seq_dna or "").upper().replace("T", "U")
 
 
-
 def insertion_to_combo_output(seq: str) -> str:
     return str(seq or "").replace("T", "U").replace("t", "u")
 
 
-
 def score_rnadna_tm_from_pbs_dna(pbs_dna: str) -> float:
     return float(pbs_tm.score_one_pbs(dna_to_rna(pbs_dna))["tm"])
-
 
 
 def find_spacer_matches(genomic_seq: str, spacer: str, nick_offset: int = 3) -> list[SpacerMatch]:
@@ -127,10 +131,8 @@ def find_spacer_matches(genomic_seq: str, spacer: str, nick_offset: int = 3) -> 
     nick_offset = int(nick_offset)
     if nick_offset < 0:
         raise ValueError("Nick offset must be 0 or greater.")
-
     pattern = re.compile(rf"(?=({re.escape(spacer_dna)}))", flags=re.IGNORECASE)
     matches: list[SpacerMatch] = []
-
     for match in pattern.finditer(seq_plus):
         spacer_start_plus = match.start()
         spacer_end_plus = spacer_start_plus + spacer_len
@@ -148,7 +150,6 @@ def find_spacer_matches(genomic_seq: str, spacer: str, nick_offset: int = 3) -> 
                 nick_target=nick_plus,
             )
         )
-
     for match in pattern.finditer(seq_minus):
         spacer_start_minus = match.start()
         spacer_end_minus = spacer_start_minus + spacer_len
@@ -169,9 +170,7 @@ def find_spacer_matches(genomic_seq: str, spacer: str, nick_offset: int = 3) -> 
                 nick_target=nick_minus,
             )
         )
-
     return matches
-
 
 
 def resolve_unique_match(genomic_seq: str, spacer: str, nick_offset: int = 3) -> SpacerMatch:
@@ -183,10 +182,10 @@ def resolve_unique_match(genomic_seq: str, spacer: str, nick_offset: int = 3) ->
             f"{m.strand} strand at position {m.spacer_start_plus + 1}" for m in matches[:10]
         )
         raise ValueError(
-            f"Spacer matched multiple sites ({len(matches)} total). Please disambiguate. Matches: {summary}"
+            f"Spacer matched multiple sites ({len(matches)} total). "
+            f"Please disambiguate. Matches: {summary}"
         )
     return matches[0]
-
 
 
 def get_target_sequence_and_match(genomic_seq: str, spacer: str, nick_offset: int = 3) -> tuple[str, SpacerMatch]:
@@ -195,7 +194,6 @@ def get_target_sequence_and_match(genomic_seq: str, spacer: str, nick_offset: in
     match = resolve_unique_match(seq_plus, spacer, nick_offset=nick_offset)
     target_seq = seq_plus if match.strand == "+" else seq_minus
     return target_seq, match
-
 
 
 def _make_selector_bases(target_seq: str, match: SpacerMatch, start: int, end: int) -> list[RTTSelectorBase]:
@@ -215,22 +213,18 @@ def _make_selector_bases(target_seq: str, match: SpacerMatch, start: int, end: i
     return out
 
 
-
 def build_rtt_start_selector(genomic_seq: str, spacer: str, nick_offset: int = 3) -> RTTStartSelector:
     target_seq, match = get_target_sequence_and_match(
         genomic_seq=genomic_seq,
         spacer=spacer,
         nick_offset=nick_offset,
     )
-
     row1_start = match.spacer_end_target - RTT_SELECTOR_SPACER_CONTEXT
     row1_end = match.spacer_end_target + RTT_SELECTOR_POST_SPACER_ROW1
     row2_start = row1_end
     row2_end = row2_start + RTT_SELECTOR_POST_SPACER_ROW2
-
     row1 = _make_selector_bases(target_seq, match, row1_start, row1_end)
     row2 = _make_selector_bases(target_seq, match, row2_start, row2_end)
-
     return RTTStartSelector(
         match=match,
         target_orientation=("sense/+" if match.strand == "+" else "reverse-complement/-"),
@@ -238,7 +232,6 @@ def build_rtt_start_selector(genomic_seq: str, spacer: str, nick_offset: int = 3
         row1=row1,
         row2=row2,
     )
-
 
 
 def parse_length_list(text: str, minimum: int, maximum: int, label: str) -> list[int]:
@@ -259,32 +252,29 @@ def parse_length_list(text: str, minimum: int, maximum: int, label: str) -> list
     return values
 
 
-
 def evenly_spaced_lengths(min_len: int, max_len: int, count: int) -> list[int]:
     min_len = int(min_len)
     max_len = int(max_len)
     count = int(count)
-
     if min_len > max_len:
         raise ValueError("RTT min length cannot be greater than RTT max length.")
     if count < 2:
         raise ValueError("RTT count must be at least 2 in range mode.")
     if count > (max_len - min_len + 1):
         raise ValueError("RTT count is too large for the selected min/max range to produce unique integer lengths.")
-
     if count == 2:
         return [min_len, max_len]
-
     step = (max_len - min_len) / (count - 1)
     values = [math.ceil(min_len + i * step) for i in range(count)]
     values[0] = min_len
     values[-1] = max_len
     values = sorted(set(values))
-
     if len(values) != count:
-        raise ValueError("RTT count and range produced duplicate lengths after rounding. Please reduce count or widen the range.")
+        raise ValueError(
+            "RTT count and range produced duplicate lengths after rounding. "
+            "Please reduce count or widen the range."
+        )
     return values
-
 
 
 def build_pbs_candidate(target_seq_dna: str, nick_target: int, pbs_len: int) -> Optional[dict]:
@@ -303,7 +293,6 @@ def build_pbs_candidate(target_seq_dna: str, nick_target: int, pbs_len: int) -> 
     }
 
 
-
 def build_rtt_candidate(target_seq_dna: str, rtt_start_target: int, rtt_len: int) -> Optional[dict]:
     if rtt_start_target < 0:
         return None
@@ -320,12 +309,54 @@ def build_rtt_candidate(target_seq_dna: str, rtt_start_target: int, rtt_len: int
     }
 
 
+def orient_insertion_for_flap(typed_ins_dna: str, strand: str, orientation: str) -> str:
+    """Return the insertion in the flap (matched/nicked-strand) orientation.
+
+    The user types the insertion in their input-DNA (sense/plus) orientation. The flap is
+    synthesized in the matched-strand orientation (= input orientation on the + strand,
+    = reverse complement of the input on the - strand).
+
+    orientation:
+      - "auto"/"forward": the insertion should read forward (as typed) in the final input DNA.
+      - "reverse": the insertion should read reverse-complemented in the final input DNA.
+
+    Net effect (default forward): the edited input strand always carries the insertion exactly
+    as typed, regardless of which strand the spacer matched.
+    """
+    ins = clean_dna(typed_ins_dna)
+    if strand == "-":
+        ins = revcomp_dna(ins)  # convert input-orientation -> minus-strand (flap) orientation
+    if orientation == INSERTION_ORIENTATION_REVERSE:
+        ins = revcomp_dna(ins)
+    return ins
+
+
+def build_addition_homology_rtt(target_seq_dna: str, insert_after_target: int, homology_len: int) -> Optional[dict]:
+    """Addition-mode RTT column = reverse-complement RNA of the 3' homology arm only.
+
+    The homology arm is the genomic stretch immediately downstream of the insertion site.
+    The retained genomic (nick -> insertion site) and the insertion itself live in the
+    'insert' column, so that RTT + insert + PBS concatenates into the pegRNA 3' extension.
+    """
+    if homology_len < 1:
+        return None
+    downstream_start = insert_after_target + 1
+    if downstream_start < 0:
+        return None
+    homology = target_seq_dna[downstream_start:downstream_start + homology_len]
+    if len(homology) != homology_len:
+        return None
+    rtt_dna = revcomp_dna(homology)
+    return {
+        "Sequence": dna_to_rna(rtt_dna),
+        "Length": homology_len,
+    }
+
 
 def pick_tm_optimal_pbs(target_seq_dna: str, nick_target: int) -> tuple[Optional[int], Optional[float]]:
     best_len = None
     best_tm = None
     best_score = None
-
     for length in range(PBS_MIN_LEN, PBS_MAX_LEN + 1):
         candidate = build_pbs_candidate(target_seq_dna, nick_target, length)
         if candidate is None:
@@ -336,21 +367,17 @@ def pick_tm_optimal_pbs(target_seq_dna: str, nick_target: int) -> tuple[Optional
             best_score = score
             best_len = length
             best_tm = tm
-
     return best_len, best_tm
-
 
 
 def pbs_lengths_from_mode(target_seq_dna: str, nick_target: int, shorter: int = 0, longer: int = 0) -> tuple[list[int], Optional[int], Optional[float]]:
     default_len, default_tm = pick_tm_optimal_pbs(target_seq_dna, nick_target)
     if default_len is None:
         raise ValueError("No valid PBS could be generated at this nick site.")
-
     shorter = max(0, int(shorter))
     longer = max(0, int(longer))
     lengths = list(range(max(PBS_MIN_LEN, default_len - shorter), min(PBS_MAX_LEN, default_len + longer) + 1))
     return lengths, default_len, default_tm
-
 
 
 def rtt_lengths_from_mode(rtt_mode: str, manual_lengths_text: str = "", min_len: int = 10, max_len: int = 20, count: int = 3) -> list[int]:
@@ -359,15 +386,12 @@ def rtt_lengths_from_mode(rtt_mode: str, manual_lengths_text: str = "", min_len:
     return evenly_spaced_lengths(min_len=min_len, max_len=max_len, count=count)
 
 
-
 def format_plain_sequences(sequences: list[str]) -> str:
     return "\n".join(sequences)
 
 
-
 def format_delimited_rows(rows: list[tuple[str, ...]]) -> str:
     return "\n".join("\t".join(row) for row in rows)
-
 
 
 def design_pbs_rtt(
@@ -385,6 +409,9 @@ def design_pbs_rtt(
     rtt_start_target: Optional[int] = None,
     include_insertion: bool = True,
     insertion_sequence: str = "",
+    addition_mode: bool = False,
+    insertion_orientation: str = INSERTION_ORIENTATION_AUTO,
+    insert_at_nick: bool = False,
 ) -> DesignResult:
     target_seq, match = get_target_sequence_and_match(
         genomic_seq=genomic_seq,
@@ -392,7 +419,9 @@ def design_pbs_rtt(
         nick_offset=nick_offset,
     )
 
-    insertion_sequence = validate_insertion_sequence(insertion_sequence, allow_empty=True)
+    insertion_sequence = validate_insertion_sequence(insertion_sequence, allow_empty=not addition_mode)
+    if addition_mode and not insertion_sequence:
+        raise ValueError("Addition (pure insertion) mode requires a non-empty insertion sequence.")
 
     pbs_lengths, default_pbs_len, default_pbs_tm = pbs_lengths_from_mode(
         target_seq_dna=target_seq,
@@ -408,12 +437,23 @@ def design_pbs_rtt(
         count=rtt_count,
     )
 
+    # Resolve the site.
+    #  - legacy mode: first base included in RTT.
+    #  - addition mode: the base AFTER which the insertion is placed.
     if rtt_start_mode == "nick":
-        effective_rtt_start_target = match.nick_target
+        effective_site_target = match.nick_target
     else:
-        effective_rtt_start_target = match.nick_target if rtt_start_target is None else int(rtt_start_target)
-        if effective_rtt_start_target < match.nick_target:
-            raise ValueError("Selected RTT start must be at or downstream of the nick site in the matched orientation.")
+        effective_site_target = match.nick_target if rtt_start_target is None else int(rtt_start_target)
+
+    if addition_mode and insert_at_nick:
+        # Insert right at the nick junction: retain zero genomic bases.
+        effective_site_target = match.nick_target - 1
+
+    if not (addition_mode and insert_at_nick):
+        if effective_site_target < match.nick_target:
+            raise ValueError("Selected site must be at or downstream of the nick site in the matched orientation.")
+    if effective_site_target >= len(target_seq):
+        raise ValueError("Selected site is outside the target sequence.")
 
     pbs_rows: list[dict] = []
     rtt_rows: list[dict] = []
@@ -428,25 +468,51 @@ def design_pbs_rtt(
         else:
             pbs_rows.append(candidate)
 
-    for rtt_len in rtt_lengths:
-        candidate = build_rtt_candidate(target_seq, effective_rtt_start_target, rtt_len)
-        if candidate is None:
-            skipped_rtt.append(rtt_len)
-        else:
-            rtt_rows.append(candidate)
+    addition_insert_rna: Optional[str] = None
+    addition_retained_dna: Optional[str] = None
+
+    if addition_mode:
+        typed_ins_dna = clean_dna(insertion_sequence)
+        ins_flap = orient_insertion_for_flap(typed_ins_dna, match.strand, insertion_orientation)
+        # Retained genomic (matched-strand orientation) from the nick up to and including the site.
+        retained = target_seq[match.nick_target:effective_site_target + 1]
+        addition_retained_dna = retained
+        # 'insert' column = reverse-complement RNA of (retained + insertion), so that
+        # RTT (revcomp homology) + insert + PBS = the pegRNA 3' extension (5'->3').
+        insert_region_dna = retained + ins_flap
+        addition_insert_rna = dna_to_rna(revcomp_dna(insert_region_dna))
+        for homology_len in rtt_lengths:
+            candidate = build_addition_homology_rtt(target_seq, effective_site_target, homology_len)
+            if candidate is None:
+                skipped_rtt.append(homology_len)
+            else:
+                rtt_rows.append(candidate)
+    else:
+        for rtt_len in rtt_lengths:
+            candidate = build_rtt_candidate(target_seq, effective_site_target, rtt_len)
+            if candidate is None:
+                skipped_rtt.append(rtt_len)
+            else:
+                rtt_rows.append(candidate)
 
     if not pbs_rows:
         raise ValueError("None of the requested PBS lengths could be generated at this nick site.")
     if not rtt_rows:
+        if addition_mode:
+            raise ValueError("None of the requested homology-arm lengths fit downstream of the insertion site.")
         raise ValueError("None of the requested RTT lengths could be generated at this RTT start site.")
 
     if skipped_pbs:
         warnings.append("Skipped PBS lengths outside sequence bounds at this nick site: " + ", ".join(map(str, skipped_pbs)))
     if skipped_rtt:
-        warnings.append("Skipped RTT lengths outside sequence bounds at this RTT start site: " + ", ".join(map(str, skipped_rtt)))
+        if addition_mode:
+            warnings.append("Skipped homology-arm lengths that run past the end of the sequence downstream of the insertion site: " + ", ".join(map(str, skipped_rtt)))
+        else:
+            warnings.append("Skipped RTT lengths outside sequence bounds at this RTT start site: " + ", ".join(map(str, skipped_rtt)))
 
     pbs_df = pd.DataFrame(pbs_rows).sort_values(["Length", "Sequence"]).reset_index(drop=True)
     pbs_df["Tm"] = pbs_df["Tm"].map(lambda x: round(float(x), 2))
+
     rtt_df = pd.DataFrame(rtt_rows).sort_values(["Length", "Sequence"]).reset_index(drop=True)
 
     rtt_sequences = rtt_df["Sequence"].tolist()
@@ -456,7 +522,16 @@ def design_pbs_rtt(
     rtt_pbs_text = format_delimited_rows(rtt_pbs_rows)
 
     rtt_insert_pbs_text = ""
-    if include_insertion and insertion_sequence:
+    if addition_mode:
+        # 3-column pegRNA-extension pieces: RTT (revcomp homology) | insert (revcomp retained+insertion) | PBS.
+        rtt_insert_pbs_rows = [
+            (rtt_seq, addition_insert_rna, pbs_seq)
+            for pbs_seq in pbs_sequences
+            for rtt_seq in rtt_sequences
+        ]
+        rtt_insert_pbs_text = format_delimited_rows(rtt_insert_pbs_rows)
+    elif include_insertion and insertion_sequence:
+        # Legacy behavior: insertion block placed between RTT and PBS (forward, not templated into RTT).
         insert_for_output = insertion_to_combo_output(insertion_sequence)
         rtt_insert_pbs_rows = [
             (rtt_seq, insert_for_output, pbs_seq)
@@ -465,7 +540,25 @@ def design_pbs_rtt(
         ]
         rtt_insert_pbs_text = format_delimited_rows(rtt_insert_pbs_rows)
 
-    summary_line = f"Spacer matching strand: {match.strand}; Default PBS: {default_pbs_len} nt, Tm = {round(float(default_pbs_tm), 2)} °C"
+    summary_line = f"Spacer matching strand: {match.strand}; Default PBS: {default_pbs_len} nt, Tm = {round(float(default_pbs_tm), 2)} \u00b0C"
+    if addition_mode:
+        if insert_at_nick or effective_site_target < match.nick_target:
+            site_desc = "at the nick junction (0 retained bases)"
+        else:
+            offset = effective_site_target - match.nick_target
+            site_desc = f"after site +{offset} (base '{target_seq[effective_site_target]}')"
+        orient_desc = {
+            INSERTION_ORIENTATION_AUTO: "auto / strand-aware (forward in input DNA)",
+            INSERTION_ORIENTATION_FORWARD: "forced forward in input DNA",
+            INSERTION_ORIENTATION_REVERSE: "forced reverse-complement in input DNA",
+        }.get(insertion_orientation, insertion_orientation)
+        summary_line += (
+            f"; Mode: Addition (pure insertion) on the {match.strand} strand \u2014 "
+            f"{len(clean_dna(insertion_sequence))} nt inserted {site_desc}; "
+            f"orientation: {orient_desc}. RTT column = reverse-complement RNA of the 3\u2032 homology arm; "
+            f"insert (revcomp of retained+insertion) = {addition_insert_rna}. "
+            f"RTT + insert + PBS = pegRNA 3\u2032 extension."
+        )
 
     return DesignResult(
         match=match,
@@ -480,4 +573,9 @@ def design_pbs_rtt(
         rtt_insert_pbs_text=rtt_insert_pbs_text,
         summary_line=summary_line,
         warnings=warnings,
+        addition_mode=addition_mode,
+        addition_insert_rna=addition_insert_rna,
+        addition_retained_dna=addition_retained_dna,
+        insertion_orientation_applied=(insertion_orientation if addition_mode else None),
+        detected_strand=match.strand,
     )
