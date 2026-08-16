@@ -6,11 +6,16 @@ from html import escape
 import streamlit as st
 
 from pbs_rtt_designer_core import (
+    BATCH_COLUMNS,
+    BATCH_PLACEMENT_NICK,
+    BATCH_PLACEMENT_POSITION,
     INSERTION_ORIENTATION_AUTO,
     INSERTION_ORIENTATION_FORWARD,
     INSERTION_ORIENTATION_REVERSE,
     build_rtt_start_selector,
+    design_batch_insertion,
     design_pbs_rtt,
+    parse_two_column_table,
     validate_insertion_sequence,
 )
 
@@ -180,7 +185,7 @@ def render_rtt_start_selector(selector, signature: str, show_buttons: bool = Tru
                         base.base,
                         key=f"rtt_start_btn_{signature}_{base.target_index}",
                         type=("primary" if base.target_index == selected_target else "secondary"),
-                        use_container_width=True,
+                        width="stretch",
                         help=button_help,
                     )
                     if clicked:
@@ -191,7 +196,7 @@ def render_rtt_start_selector(selector, signature: str, show_buttons: bool = Tru
                         base.base,
                         key=f"rtt_start_btn_disabled_{signature}_{base.target_index}",
                         disabled=True,
-                        use_container_width=True,
+                        width="stretch",
                     )
     else:
         if addition_mode:
@@ -199,6 +204,211 @@ def render_rtt_start_selector(selector, signature: str, show_buttons: bool = Tru
         else:
             st.caption("RTT start is locked to the nick site in this mode.")
     return int(st.session_state.get("selected_rtt_start_target", selected_target))
+
+
+
+def render_batch_mode() -> None:
+    st.markdown("## Batch pure-insertion designer")
+    st.caption(
+        "Enter a list of spacers and a list of insertions. Every spacer \u00d7 insertion "
+        "combination is designed in pure-insertion (Addition) mode. For each design, "
+        "RTT + insert + PBS concatenate into that pegRNA's 3\u2032 extension. Output is a table "
+        "(sorted spacer-major, then insertion-major) with a CSV download."
+    )
+
+    genomic_seq = st.text_area(
+        "Input DNA (amplicon / reference)",
+        height=150,
+        placeholder="Paste the reference DNA (A/C/G/T; U accepted and converted to T).",
+        key="batch_input_dna",
+    )
+
+    col_sp, col_ins = st.columns(2)
+    with col_sp:
+        spacers_text = st.text_area(
+            "Spacers  \u2014  ID <tab/space/comma> sequence, one per line",
+            height=170,
+            value=(
+                "c9sg066\tGCAGCGGCCGGGGCTGGCCACC\n"
+                "c9sg068\tCTGGCAGCAGCGGCCGGGGCTG\n"
+                "c9sg069\tTGCTGGGTAGAGGTGGCCAGCC"
+            ),
+            key="batch_spacers",
+        )
+    with col_ins:
+        insertions_text = st.text_area(
+            "Insertions  \u2014  ID <tab/space/comma> sequence, one per line",
+            height=170,
+            value=("ETS-ETS\tACCGGAAGTAGCACCGGAAGTA\nETS\tACCGGAAGTA"),
+            key="batch_insertions",
+        )
+
+    st.markdown("### Insertion placement")
+    place_col, pos_col = st.columns([6, 4])
+    with place_col:
+        placement_label = st.radio(
+            "Where to place each insertion",
+            options=[
+                "At the nick (retain 0 bases)",
+                "After a specific input-DNA position",
+            ],
+            index=0,
+            key="batch_placement",
+        )
+    placement_mode = (
+        BATCH_PLACEMENT_NICK
+        if placement_label.startswith("At the nick")
+        else BATCH_PLACEMENT_POSITION
+    )
+    position_1based = None
+    with pos_col:
+        if placement_mode == BATCH_PLACEMENT_POSITION:
+            position_1based = st.number_input(
+                "Insert AFTER this position (1-based)",
+                min_value=1,
+                max_value=1000000,
+                value=1,
+                step=1,
+                key="batch_position",
+                help="1-based position in the input DNA; the insertion goes right after this base. "
+                "Example: AAAAATTTTT, position 5, insertion CCCC \u2192 AAAAACCCCTTTTT. Spacers whose nick "
+                "cannot reach this position (wrong side / too far) are skipped and listed in a warning.",
+            )
+        else:
+            st.caption("Insertion goes right at each spacer's nick junction (0 retained bases).")
+
+    orient_col, off_col = st.columns([6, 4])
+    with orient_col:
+        orientation_label = st.selectbox(
+            "Insertion orientation (in your input DNA)",
+            options=[
+                "Auto \u2014 strand-aware (forward)",
+                "Force forward",
+                "Force reverse-complement",
+            ],
+            index=0,
+            key="batch_orient",
+            help="Auto/forward: the insertion reads forward (exactly as typed) in the edited input DNA "
+            "regardless of which strand the spacer matched. Force reverse-complement flips it in the input DNA.",
+        )
+    insertion_orientation = {
+        "Auto \u2014 strand-aware (forward)": INSERTION_ORIENTATION_AUTO,
+        "Force forward": INSERTION_ORIENTATION_FORWARD,
+        "Force reverse-complement": INSERTION_ORIENTATION_REVERSE,
+    }[orientation_label]
+    with off_col:
+        nick_offset = st.number_input(
+            "Nick offset",
+            min_value=0,
+            max_value=50,
+            value=3,
+            key="batch_nick_offset",
+            help="Nick placed this many nt upstream of the spacer 3\u2032 end in the matched orientation.",
+        )
+
+    st.markdown("### PBS & RTT (3\u2032 homology arm) settings")
+    pcol1, pcol2 = st.columns(2)
+    with pcol1:
+        pbs_shorter = st.slider("Include shorter PBS lengths", 0, 20, 0, key="batch_pbs_short")
+    with pcol2:
+        pbs_longer = st.slider("Include longer PBS lengths", 0, 20, 0, key="batch_pbs_long")
+
+    rmode_col, r1, r2, r3 = st.columns([3, 2, 2, 2])
+    with rmode_col:
+        rtt_mode_label = st.radio(
+            "RTT / homology-arm lengths",
+            options=["Min / max / count", "Manual exact lengths"],
+            index=0,
+            key="batch_rtt_mode",
+        )
+    rtt_mode = "range" if rtt_mode_label == "Min / max / count" else "manual"
+    rtt_manual_lengths = ""
+    rtt_min, rtt_max, rtt_count = 10, 20, 3
+    if rtt_mode == "range":
+        with r1:
+            rtt_min = st.number_input("Arm min", 1, 500, 10, key="batch_rtt_min")
+        with r2:
+            rtt_max = st.number_input("Arm max", 1, 500, 20, key="batch_rtt_max")
+        with r3:
+            rtt_count = st.number_input("How many", 2, 100, 3, key="batch_rtt_count")
+    else:
+        with r1:
+            rtt_manual_lengths = st.text_input(
+                "Manual arm lengths", value="10,15,20", key="batch_rtt_manual",
+                help="Comma- or space-separated homology-arm lengths.",
+            )
+
+    run = st.button("Run batch design", type="primary", width="stretch")
+    if not run:
+        return
+
+    if not genomic_seq.strip():
+        st.error("Please paste the input DNA.")
+        return
+    try:
+        spacers = parse_two_column_table(spacers_text, "Spacers", validate_dna=True)
+        insertions = parse_two_column_table(insertions_text, "Insertions", validate_dna=False)
+    except Exception as exc:
+        st.error(str(exc))
+        return
+
+    try:
+        df, batch_warnings = design_batch_insertion(
+            genomic_seq=genomic_seq,
+            spacers=spacers,
+            insertions=insertions,
+            placement_mode=placement_mode,
+            position_1based=(int(position_1based) if position_1based is not None else None),
+            nick_offset=int(nick_offset),
+            pbs_shorter=int(pbs_shorter),
+            pbs_longer=int(pbs_longer),
+            rtt_mode=rtt_mode,
+            rtt_manual_lengths=rtt_manual_lengths,
+            rtt_min=int(rtt_min),
+            rtt_max=int(rtt_max),
+            rtt_count=int(rtt_count),
+            insertion_orientation=insertion_orientation,
+        )
+    except Exception as exc:
+        st.error(str(exc))
+        return
+
+    if batch_warnings:
+        for warning in batch_warnings:
+            st.warning(warning)
+
+    if df.empty:
+        st.info("No valid designs were produced \u2014 see the warnings above.")
+        return
+
+    st.success(
+        f"Generated {len(df)} row(s) across {df['spacer ID'].nunique()} spacer(s) "
+        f"and {df['insertion ID'].nunique()} insertion(s)."
+    )
+    st.dataframe(df, width="stretch", hide_index=True)
+
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download CSV",
+        data=csv_bytes,
+        file_name="batch_pegRNA_insertion_designs.csv",
+        mime="text/csv",
+        type="primary",
+        width="stretch",
+    )
+
+
+app_mode = st.radio(
+    "Tool mode",
+    options=["Single design", "Batch pure-insertion"],
+    index=0,
+    horizontal=True,
+    key="app_mode",
+)
+
+if app_mode == "Batch pure-insertion":
+    render_batch_mode()
+    st.stop()
 
 
 left_col, right_col = st.columns(2)
@@ -479,11 +689,11 @@ if run:
         with c1:
             st.markdown("### RTT" + (" (3\u2032 homology arm)" if result.addition_mode else ""))
             st.code(result.rtt_text, language=None)
-            st.dataframe(result.rtt_df, use_container_width=True)
+            st.dataframe(result.rtt_df, width="stretch")
         with c2:
             st.markdown("### PBS")
             st.code(result.pbs_text, language=None)
-            st.dataframe(result.pbs_df, use_container_width=True)
+            st.dataframe(result.pbs_df, width="stretch")
         if result.addition_mode and result.addition_insert_rna:
             st.markdown("### insert (retained genomic + insertion, reverse-complemented)")
             st.code(result.addition_insert_rna, language=None)

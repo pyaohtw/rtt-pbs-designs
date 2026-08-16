@@ -579,3 +579,241 @@ def design_pbs_rtt(
         insertion_orientation_applied=(insertion_orientation if addition_mode else None),
         detected_strand=match.strand,
     )
+
+
+# ---------------------------------------------------------------------------
+# Batch pure-insertion mode
+# ---------------------------------------------------------------------------
+
+BATCH_PLACEMENT_NICK = "nick"          # insert exactly at the nick (retain 0 bases)
+BATCH_PLACEMENT_POSITION = "position"  # insert right after a 1-based input-DNA position
+
+QWC_HALF_WINDOW = 22
+
+BATCH_COLUMNS = [
+    "spacer ID",
+    "spacer seq",
+    "insertion ID",
+    "insertion seq",
+    "RTT",
+    "insert",
+    "PBS",
+    "input DNA",
+    "edited DNA",
+    "Quantification_Window_Coordinates",
+]
+
+
+def parse_two_column_table(text: str, label: str, validate_dna: bool = True) -> list[tuple[str, str]]:
+    """Parse a 2-column (ID, sequence) block.
+
+    Accepts tab / comma / multi-space separated columns, one entry per line.
+    Blank lines and lines starting with '#' are ignored. Returns [(id, seq), ...]
+    preserving input order. Duplicate IDs raise an error.
+    """
+    rows: list[tuple[str, str]] = []
+    seen_ids: set[str] = set()
+    for lineno, raw in enumerate(str(text or "").splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = re.split(r"[\t,]+|\s{2,}|\s+", line)
+        parts = [p for p in parts if p != ""]
+        if len(parts) < 2:
+            raise ValueError(f"{label} line {lineno} needs two columns (ID and sequence): {raw!r}")
+        entry_id = parts[0].strip()
+        seq = "".join(parts[1:]).strip()
+        if not entry_id:
+            raise ValueError(f"{label} line {lineno} is missing an ID.")
+        if entry_id in seen_ids:
+            raise ValueError(f"{label} has a duplicate ID: {entry_id}")
+        if validate_dna:
+            seq = clean_spacer(seq)  # uppercases, U->T, validates ACGT
+        else:
+            seq = clean_dna(seq)
+        seen_ids.add(entry_id)
+        rows.append((entry_id, seq))
+    if not rows:
+        raise ValueError(f"No valid {label.lower()} entries were provided.")
+    return rows
+
+
+def quantification_window_coordinates(nick_plus: int, seq_len: int, half: int = QWC_HALF_WINDOW) -> str:
+    """CRISPResso -qwc string, 0-based, clipped to [0, seq_len-1].
+
+    Window center is the nick site expressed in input-DNA (plus-strand) coordinates,
+    which equals the 0-based index of the base immediately 3' of the cut on the plus
+    strand, regardless of which strand the spacer matched.
+    """
+    start = max(0, nick_plus - half)
+    stop = min(seq_len - 1, nick_plus + half)
+    return f"{start}-{stop}"
+
+
+def _insertion_in_input_orientation(typed_ins_dna: str, orientation: str) -> str:
+    """Insertion as it appears in the edited input (plus) DNA.
+
+    auto/forward -> as typed; reverse -> reverse complement of typed.
+    """
+    ins = clean_dna(typed_ins_dna)
+    if orientation == INSERTION_ORIENTATION_REVERSE:
+        ins = revcomp_dna(ins)
+    return ins
+
+
+def _resolve_batch_site(match: SpacerMatch, seq_len: int, placement_mode: str, position_1based: Optional[int]):
+    """Map a placement request to (rtt_start_target, insert_at_nick, insert_pos_plus).
+
+    insert_pos_plus is the 0-based plus-strand slice index where the insertion is
+    spliced into the input DNA (edited = input[:insert_pos_plus] + ins + input[insert_pos_plus:]).
+
+    Returns None if the requested position is not reachable from this spacer's nick
+    on the RTT-templated (downstream) side.
+    """
+    if placement_mode == BATCH_PLACEMENT_NICK:
+        return {"rtt_start_target": None, "insert_at_nick": True, "insert_pos_plus": match.nick_plus}
+
+    if position_1based is None:
+        raise ValueError("Position mode requires a 1-based input-DNA position.")
+    P = int(position_1based)
+    if P < 1 or P > seq_len:
+        raise ValueError(f"Position must be between 1 and {seq_len} (got {P}).")
+
+    # Insertion junction sits at plus coordinate P (insert right AFTER plus index P-1).
+    insert_pos_plus = P
+
+    if match.strand == "+":
+        # Reachable when junction is at or downstream (>=) of the nick.
+        if P < match.nick_plus:
+            return None
+        if P == match.nick_plus:
+            return {"rtt_start_target": None, "insert_at_nick": True, "insert_pos_plus": insert_pos_plus}
+        # retain (P - nick_plus) genomic bases; last retained plus index = P-1
+        return {"rtt_start_target": P - 1, "insert_at_nick": False, "insert_pos_plus": insert_pos_plus}
+    else:
+        # Minus strand: reachable when junction is at or downstream on the minus strand,
+        # i.e. P <= nick_plus (lower plus coordinate).
+        if P > match.nick_plus:
+            return None
+        if P == match.nick_plus:
+            return {"rtt_start_target": None, "insert_at_nick": True, "insert_pos_plus": insert_pos_plus}
+        # last retained minus index = n - P - 1
+        return {"rtt_start_target": seq_len - P - 1, "insert_at_nick": False, "insert_pos_plus": insert_pos_plus}
+
+
+def design_batch_insertion(
+    genomic_seq: str,
+    spacers: list[tuple[str, str]],
+    insertions: list[tuple[str, str]],
+    placement_mode: str = BATCH_PLACEMENT_NICK,
+    position_1based: Optional[int] = None,
+    nick_offset: int = 3,
+    pbs_shorter: int = 0,
+    pbs_longer: int = 0,
+    rtt_mode: str = "range",
+    rtt_manual_lengths: str = "",
+    rtt_min: int = 10,
+    rtt_max: int = 20,
+    rtt_count: int = 3,
+    insertion_orientation: str = INSERTION_ORIENTATION_AUTO,
+    qwc_half: int = QWC_HALF_WINDOW,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Enumerate pure-insertion pegRNA designs for every spacer x insertion combination.
+
+    Rows are ordered spacer-major then insertion-major; within a combination all
+    RTT x PBS length combinations are expanded (each becomes one row). Returns the
+    result DataFrame (BATCH_COLUMNS) and a list of human-readable warnings/skips.
+    """
+    input_dna = clean_dna(genomic_seq)
+    seq_len = len(input_dna)
+    warnings: list[str] = []
+    out_rows: list[dict] = []
+
+    if placement_mode not in (BATCH_PLACEMENT_NICK, BATCH_PLACEMENT_POSITION):
+        raise ValueError(f"Unknown placement mode: {placement_mode}")
+
+    for spacer_id, spacer_seq in spacers:
+        # Resolve the (unique) match for this spacer.
+        try:
+            matches = find_spacer_matches(input_dna, spacer_seq, nick_offset=nick_offset)
+        except ValueError as exc:
+            warnings.append(f"[{spacer_id}] invalid spacer skipped: {exc}")
+            continue
+        if len(matches) == 0:
+            warnings.append(f"[{spacer_id}] not found in the input DNA on either strand - all combinations skipped.")
+            continue
+        if len(matches) > 1:
+            sites = "; ".join(f"{m.strand} strand @ {m.spacer_start_plus + 1}" for m in matches[:6])
+            warnings.append(f"[{spacer_id}] matched {len(matches)} sites ({sites}) - ambiguous, all combinations skipped.")
+            continue
+        match = matches[0]
+        target_seq = input_dna if match.strand == "+" else revcomp_dna(input_dna)
+
+        qwc = quantification_window_coordinates(match.nick_plus, seq_len, half=qwc_half)
+
+        # Resolve placement once per spacer (position mode) or trivially (nick mode).
+        try:
+            placement = _resolve_batch_site(match, seq_len, placement_mode, position_1based)
+        except ValueError as exc:
+            warnings.append(f"[{spacer_id}] {exc}")
+            continue
+        if placement is None:
+            side = "downstream (higher position)" if match.strand == "+" else "downstream (lower position)"
+            warnings.append(
+                f"[{spacer_id}] position {position_1based} is not reachable from this spacer's nick "
+                f"(nick at input-DNA index {match.nick_plus}, {match.strand} strand extends {side}) - "
+                f"all its insertion combinations skipped."
+            )
+            continue
+
+        for ins_id, ins_seq in insertions:
+            try:
+                result = design_pbs_rtt(
+                    genomic_seq=input_dna,
+                    spacer=spacer_seq,
+                    nick_offset=nick_offset,
+                    pbs_shorter=pbs_shorter,
+                    pbs_longer=pbs_longer,
+                    rtt_mode=rtt_mode,
+                    rtt_manual_lengths=rtt_manual_lengths,
+                    rtt_min=rtt_min,
+                    rtt_max=rtt_max,
+                    rtt_count=rtt_count,
+                    rtt_start_mode="selected",
+                    rtt_start_target=placement["rtt_start_target"],
+                    include_insertion=False,
+                    insertion_sequence=ins_seq,
+                    addition_mode=True,
+                    insertion_orientation=insertion_orientation,
+                    insert_at_nick=placement["insert_at_nick"],
+                )
+            except ValueError as exc:
+                warnings.append(f"[{spacer_id} x {ins_id}] skipped: {exc}")
+                continue
+
+            # Edited DNA (input/plus orientation), insertion forward-as-typed unless forced reverse.
+            ins_in_input = _insertion_in_input_orientation(ins_seq, insertion_orientation)
+            pos = placement["insert_pos_plus"]
+            edited_dna = input_dna[:pos] + ins_in_input + input_dna[pos:]
+
+            insert_rna = result.addition_insert_rna
+            rtt_sequences = result.rtt_df.sort_values(["Length", "Sequence"])["Sequence"].tolist()
+            pbs_sequences = result.pbs_df.sort_values(["Length", "Sequence"])["Sequence"].tolist()
+
+            for rtt_seq in rtt_sequences:
+                for pbs_seq in pbs_sequences:
+                    out_rows.append({
+                        "spacer ID": spacer_id,
+                        "spacer seq": spacer_seq,
+                        "insertion ID": ins_id,
+                        "insertion seq": ins_seq,
+                        "RTT": rtt_seq,
+                        "insert": insert_rna,
+                        "PBS": pbs_seq,
+                        "input DNA": input_dna,
+                        "edited DNA": edited_dna,
+                        "Quantification_Window_Coordinates": qwc,
+                    })
+
+    df = pd.DataFrame(out_rows, columns=BATCH_COLUMNS)
+    return df, warnings
