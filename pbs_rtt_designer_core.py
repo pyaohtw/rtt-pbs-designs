@@ -310,25 +310,28 @@ def build_rtt_candidate(target_seq_dna: str, rtt_start_target: int, rtt_len: int
 
 
 def orient_insertion_for_flap(typed_ins_dna: str, strand: str, orientation: str) -> str:
-    """Return the insertion in the flap (matched/nicked-strand) orientation.
+    """Return the insertion in the pegRNA flap/matched-strand orientation.
 
-    The user types the insertion in their input-DNA (sense/plus) orientation. The flap is
-    synthesized in the matched-strand orientation (= input orientation on the + strand,
-    = reverse complement of the input on the - strand).
+    The user types the insertion in input-DNA (plus/sense) orientation.
 
-    orientation:
-      - "auto"/"forward": the insertion should read forward (as typed) in the final input DNA.
-      - "reverse": the insertion should read reverse-complemented in the final input DNA.
-
-    Net effect (default forward): the edited input strand always carries the insertion exactly
-    as typed, regardless of which strand the spacer matched.
+    - ``forward`` forces the edited input DNA to contain the typed sequence.
+    - ``reverse`` forces the edited input DNA to contain its reverse complement.
+    - ``auto``/strand-aware keeps the typed sequence in pegRNA/matched-strand
+      orientation; therefore a minus-strand spacer produces the reverse complement
+      in the edited input DNA.
     """
     ins = clean_dna(typed_ins_dna)
-    if strand == "-":
-        ins = revcomp_dna(ins)  # convert input-orientation -> minus-strand (flap) orientation
+    if orientation == INSERTION_ORIENTATION_AUTO:
+        # Strand-aware: the pegRNA flap carries the typed sequence in the matched
+        # orientation. The resulting edited input sequence is strand-dependent.
+        return ins
+    if orientation == INSERTION_ORIENTATION_FORWARD:
+        # Force the edited input DNA to carry the typed sequence.
+        return ins if strand == "+" else revcomp_dna(ins)
     if orientation == INSERTION_ORIENTATION_REVERSE:
-        ins = revcomp_dna(ins)
-    return ins
+        # Force the edited input DNA to carry the reverse complement of the typed sequence.
+        return revcomp_dna(ins) if strand == "+" else ins
+    raise ValueError(f"Unknown insertion orientation: {orientation}")
 
 
 def build_addition_homology_rtt(target_seq_dna: str, insert_after_target: int, homology_len: int) -> Optional[dict]:
@@ -410,7 +413,7 @@ def design_pbs_rtt(
     include_insertion: bool = True,
     insertion_sequence: str = "",
     addition_mode: bool = False,
-    insertion_orientation: str = INSERTION_ORIENTATION_AUTO,
+    insertion_orientation: str = INSERTION_ORIENTATION_FORWARD,
     insert_at_nick: bool = False,
 ) -> DesignResult:
     target_seq, match = get_target_sequence_and_match(
@@ -548,7 +551,7 @@ def design_pbs_rtt(
             offset = effective_site_target - match.nick_target
             site_desc = f"after site +{offset} (base '{target_seq[effective_site_target]}')"
         orient_desc = {
-            INSERTION_ORIENTATION_AUTO: "auto / strand-aware (forward in input DNA)",
+            INSERTION_ORIENTATION_AUTO: "strand-aware (pegRNA/matched-strand orientation)",
             INSERTION_ORIENTATION_FORWARD: "forced forward in input DNA",
             INSERTION_ORIENTATION_REVERSE: "forced reverse-complement in input DNA",
         }.get(insertion_orientation, insertion_orientation)
@@ -587,6 +590,7 @@ def design_pbs_rtt(
 
 BATCH_PLACEMENT_NICK = "nick"          # insert exactly at the nick (retain 0 bases)
 BATCH_PLACEMENT_POSITION = "position"  # insert right after a 1-based input-DNA position
+BATCH_PLACEMENT_POSITION_FALLBACK = "position_fallback"  # position with per-spacer 0-base fallback
 
 QWC_HALF_WINDOW = 22
 
@@ -601,6 +605,7 @@ BATCH_COLUMNS = [
     "input DNA",
     "edited DNA",
     "Quantification_Window_Coordinates",
+    "Insertion_Method",
 ]
 
 
@@ -650,55 +655,93 @@ def quantification_window_coordinates(nick_plus: int, seq_len: int, half: int = 
     return f"{start}-{stop}"
 
 
-def _insertion_in_input_orientation(typed_ins_dna: str, orientation: str) -> str:
-    """Insertion as it appears in the edited input (plus) DNA.
-
-    auto/forward -> as typed; reverse -> reverse complement of typed.
-    """
+def _insertion_in_input_orientation(typed_ins_dna: str, strand: str, orientation: str) -> str:
+    """Return the insertion sequence as it appears in edited input-DNA orientation."""
     ins = clean_dna(typed_ins_dna)
+    if orientation == INSERTION_ORIENTATION_FORWARD:
+        return ins
     if orientation == INSERTION_ORIENTATION_REVERSE:
-        ins = revcomp_dna(ins)
-    return ins
+        return revcomp_dna(ins)
+    if orientation == INSERTION_ORIENTATION_AUTO:
+        # Strand-aware mode follows the pegRNA/matched-strand orientation.
+        return ins if strand == "+" else revcomp_dna(ins)
+    raise ValueError(f"Unknown insertion orientation: {orientation}")
 
 
-def _resolve_batch_site(match: SpacerMatch, seq_len: int, placement_mode: str, position_1based: Optional[int]):
-    """Map a placement request to (rtt_start_target, insert_at_nick, insert_pos_plus).
+def _resolve_batch_site(
+    match: SpacerMatch,
+    seq_len: int,
+    placement_mode: str,
+    position_1based: Optional[int],
+    zero_base_threshold: Optional[int] = None,
+):
+    """Map a placement request to the effective batch insertion site.
 
-    insert_pos_plus is the 0-based plus-strand slice index where the insertion is
-    spliced into the input DNA (edited = input[:insert_pos_plus] + ins + input[insert_pos_plus:]).
-
-    Returns None if the requested position is not reachable from this spacer's nick
-    on the RTT-templated (downstream) side.
+    ``insert_pos_plus`` is the 0-based plus-strand slice index where the insertion is
+    spliced into the input DNA. Position-based placement is valid only downstream of
+    the nick in the strand matched by the spacer. In threshold mode, the strand-aware
+    absolute distance from the nick to the requested insertion junction is evaluated
+    only after that downstream check; distances >= ``zero_base_threshold`` use the
+    0-base-at-nick design for that spacer.
     """
     if placement_mode == BATCH_PLACEMENT_NICK:
-        return {"rtt_start_target": None, "insert_at_nick": True, "insert_pos_plus": match.nick_plus}
+        return {
+            "rtt_start_target": None,
+            "insert_at_nick": True,
+            "insert_pos_plus": match.nick_plus,
+            "insertion_method": "0-base at nick",
+        }
 
+    if placement_mode not in (BATCH_PLACEMENT_POSITION, BATCH_PLACEMENT_POSITION_FALLBACK):
+        raise ValueError(f"Unknown placement mode: {placement_mode}")
     if position_1based is None:
         raise ValueError("Position mode requires a 1-based input-DNA position.")
     P = int(position_1based)
     if P < 1 or P > seq_len:
         raise ValueError(f"Position must be between 1 and {seq_len} (got {P}).")
 
+    if placement_mode == BATCH_PLACEMENT_POSITION_FALLBACK:
+        if zero_base_threshold is None:
+            raise ValueError("Threshold mode requires a zero-base fallback threshold.")
+        zero_base_threshold = int(zero_base_threshold)
+        if zero_base_threshold < 1:
+            raise ValueError("Zero-base fallback threshold must be at least 1 bp.")
+
     # Insertion junction sits at plus coordinate P (insert right AFTER plus index P-1).
     insert_pos_plus = P
 
     if match.strand == "+":
-        # Reachable when junction is at or downstream (>=) of the nick.
+        # Reachable when the junction is at or downstream (>=) of the nick.
         if P < match.nick_plus:
             return None
-        if P == match.nick_plus:
-            return {"rtt_start_target": None, "insert_at_nick": True, "insert_pos_plus": insert_pos_plus}
-        # retain (P - nick_plus) genomic bases; last retained plus index = P-1
-        return {"rtt_start_target": P - 1, "insert_at_nick": False, "insert_pos_plus": insert_pos_plus}
+        distance = P - match.nick_plus
+        rtt_start_target = P - 1 if P > match.nick_plus else None
     else:
-        # Minus strand: reachable when junction is at or downstream on the minus strand,
-        # i.e. P <= nick_plus (lower plus coordinate).
+        # Minus strand: reachable when the junction is at or downstream on the minus
+        # strand, i.e. at a lower plus coordinate.
         if P > match.nick_plus:
             return None
-        if P == match.nick_plus:
-            return {"rtt_start_target": None, "insert_at_nick": True, "insert_pos_plus": insert_pos_plus}
-        # last retained minus index = n - P - 1
-        return {"rtt_start_target": seq_len - P - 1, "insert_at_nick": False, "insert_pos_plus": insert_pos_plus}
+        distance = match.nick_plus - P
+        rtt_start_target = seq_len - P - 1 if P < match.nick_plus else None
+
+    use_zero_base = (
+        placement_mode == BATCH_PLACEMENT_POSITION_FALLBACK
+        and distance >= int(zero_base_threshold)
+    )
+    if use_zero_base or distance == 0:
+        return {
+            "rtt_start_target": None,
+            "insert_at_nick": True,
+            "insert_pos_plus": match.nick_plus,
+            "insertion_method": "0-base at nick",
+        }
+
+    return {
+        "rtt_start_target": rtt_start_target,
+        "insert_at_nick": False,
+        "insert_pos_plus": insert_pos_plus,
+        "insertion_method": "Position-based",
+    }
 
 
 def design_batch_insertion(
@@ -715,8 +758,9 @@ def design_batch_insertion(
     rtt_min: int = 10,
     rtt_max: int = 20,
     rtt_count: int = 3,
-    insertion_orientation: str = INSERTION_ORIENTATION_AUTO,
+    insertion_orientation: str = INSERTION_ORIENTATION_FORWARD,
     qwc_half: int = QWC_HALF_WINDOW,
+    zero_base_threshold: Optional[int] = None,
 ) -> tuple[pd.DataFrame, list[str]]:
     """Enumerate pure-insertion pegRNA designs for every spacer x insertion combination.
 
@@ -729,7 +773,11 @@ def design_batch_insertion(
     warnings: list[str] = []
     out_rows: list[dict] = []
 
-    if placement_mode not in (BATCH_PLACEMENT_NICK, BATCH_PLACEMENT_POSITION):
+    if placement_mode not in (
+        BATCH_PLACEMENT_NICK,
+        BATCH_PLACEMENT_POSITION,
+        BATCH_PLACEMENT_POSITION_FALLBACK,
+    ):
         raise ValueError(f"Unknown placement mode: {placement_mode}")
 
     for spacer_id, spacer_seq in spacers:
@@ -753,7 +801,13 @@ def design_batch_insertion(
 
         # Resolve placement once per spacer (position mode) or trivially (nick mode).
         try:
-            placement = _resolve_batch_site(match, seq_len, placement_mode, position_1based)
+            placement = _resolve_batch_site(
+                match,
+                seq_len,
+                placement_mode,
+                position_1based,
+                zero_base_threshold=zero_base_threshold,
+            )
         except ValueError as exc:
             warnings.append(f"[{spacer_id}] {exc}")
             continue
@@ -792,7 +846,7 @@ def design_batch_insertion(
                 continue
 
             # Edited DNA (input/plus orientation), insertion forward-as-typed unless forced reverse.
-            ins_in_input = _insertion_in_input_orientation(ins_seq, insertion_orientation)
+            ins_in_input = _insertion_in_input_orientation(ins_seq, match.strand, insertion_orientation)
             pos = placement["insert_pos_plus"]
             edited_dna = input_dna[:pos] + ins_in_input + input_dna[pos:]
 
@@ -813,6 +867,7 @@ def design_batch_insertion(
                         "input DNA": input_dna,
                         "edited DNA": edited_dna,
                         "Quantification_Window_Coordinates": qwc,
+                        "Insertion_Method": placement["insertion_method"],
                     })
 
     df = pd.DataFrame(out_rows, columns=BATCH_COLUMNS)

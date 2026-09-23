@@ -9,6 +9,7 @@ from pbs_rtt_designer_core import (
     BATCH_COLUMNS,
     BATCH_PLACEMENT_NICK,
     BATCH_PLACEMENT_POSITION,
+    BATCH_PLACEMENT_POSITION_FALLBACK,
     INSERTION_ORIENTATION_AUTO,
     INSERTION_ORIENTATION_FORWARD,
     INSERTION_ORIENTATION_REVERSE,
@@ -251,18 +252,21 @@ def render_batch_mode() -> None:
             options=[
                 "At the nick (retain 0 bases)",
                 "After a specific input-DNA position",
+                "After a specific position (0-base fallback at threshold)",
             ],
             index=0,
             key="batch_placement",
         )
-    placement_mode = (
-        BATCH_PLACEMENT_NICK
-        if placement_label.startswith("At the nick")
-        else BATCH_PLACEMENT_POSITION
-    )
+    if placement_label.startswith("At the nick"):
+        placement_mode = BATCH_PLACEMENT_NICK
+    elif placement_label.startswith("After a specific input-DNA position"):
+        placement_mode = BATCH_PLACEMENT_POSITION
+    else:
+        placement_mode = BATCH_PLACEMENT_POSITION_FALLBACK
     position_1based = None
+    zero_base_threshold = None
     with pos_col:
-        if placement_mode == BATCH_PLACEMENT_POSITION:
+        if placement_mode in (BATCH_PLACEMENT_POSITION, BATCH_PLACEMENT_POSITION_FALLBACK):
             position_1based = st.number_input(
                 "Insert AFTER this position (1-based)",
                 min_value=1,
@@ -274,27 +278,40 @@ def render_batch_mode() -> None:
                 "Example: AAAAATTTTT, position 5, insertion CCCC \u2192 AAAAACCCCTTTTT. Spacers whose nick "
                 "cannot reach this position (wrong side / too far) are skipped and listed in a warning.",
             )
+            if placement_mode == BATCH_PLACEMENT_POSITION_FALLBACK:
+                zero_base_threshold = st.slider(
+                    "0-base fallback threshold (bp)",
+                    min_value=1,
+                    max_value=20,
+                    value=5,
+                    key="batch_zero_base_threshold",
+                    help="For each spacer, if the strand-aware downstream distance from its nick to the "
+                    "requested insertion junction is greater than or equal to this threshold, use the "
+                    "0-base-at-nick method instead. Spacers on the wrong side of the nick remain skipped.",
+                )
         else:
             st.caption("Insertion goes right at each spacer's nick junction (0 retained bases).")
 
     orient_col, off_col = st.columns([6, 4])
     with orient_col:
         orientation_label = st.selectbox(
-            "Insertion orientation (in your input DNA)",
+            "Insertion orientation",
             options=[
-                "Auto \u2014 strand-aware (forward)",
                 "Force forward",
                 "Force reverse-complement",
+                "Strand-aware (pegRNA/matched-strand orientation)",
             ],
             index=0,
             key="batch_orient",
-            help="Auto/forward: the insertion reads forward (exactly as typed) in the edited input DNA "
-            "regardless of which strand the spacer matched. Force reverse-complement flips it in the input DNA.",
+            help="Force forward: edited input DNA contains the typed insertion sequence regardless of spacer strand. "
+            "Force reverse-complement: edited input DNA contains the reverse complement of the typed sequence. "
+            "Strand-aware: the insertion follows the pegRNA/matched-strand orientation, so the inserted segment "
+            "in the insert output is the reverse complement of the typed input sequence.",
         )
     insertion_orientation = {
-        "Auto \u2014 strand-aware (forward)": INSERTION_ORIENTATION_AUTO,
         "Force forward": INSERTION_ORIENTATION_FORWARD,
         "Force reverse-complement": INSERTION_ORIENTATION_REVERSE,
+        "Strand-aware (pegRNA/matched-strand orientation)": INSERTION_ORIENTATION_AUTO,
     }[orientation_label]
     with off_col:
         nick_offset = st.number_input(
@@ -368,6 +385,9 @@ def render_batch_mode() -> None:
             rtt_max=int(rtt_max),
             rtt_count=int(rtt_count),
             insertion_orientation=insertion_orientation,
+            zero_base_threshold=(
+                int(zero_base_threshold) if zero_base_threshold is not None else None
+            ),
         )
     except Exception as exc:
         st.error(str(exc))
@@ -463,29 +483,29 @@ with left_col:
             )
 
     # Addition-mode specific controls.
-    insertion_orientation = INSERTION_ORIENTATION_AUTO
+    insertion_orientation = INSERTION_ORIENTATION_FORWARD
     insert_at_nick = False
     if addition_mode:
         orient_col, atnick_col = st.columns([6, 5])
         with orient_col:
             orientation_label = st.selectbox(
-                "Insertion orientation (in your input DNA)",
+                "Insertion orientation",
                 options=[
-                    "Auto \u2014 strand-aware (forward)",
                     "Force forward",
                     "Force reverse-complement",
+                    "Strand-aware (pegRNA/matched-strand orientation)",
                 ],
                 index=0,
-                help="Auto: detect the spacer strand and place the insertion so it reads forward (as typed) "
-                "in your input DNA \u2014 sense spacer keeps it forward-in-input (reverse-complemented inside the RTT), "
-                "antisense spacer keeps the insertion forward inside the RTT. Force forward / Force "
-                "reverse-complement override that so the insertion reads forward or reverse-complemented "
-                "in your input DNA regardless of strand.",
+                help="Force forward: edited input DNA contains the typed insertion sequence regardless of spacer strand. "
+                "Force reverse-complement: edited input DNA contains the reverse complement of the typed sequence. "
+                "Strand-aware: the insertion follows the pegRNA/matched-strand orientation; for a minus-strand "
+                "spacer, the edited input DNA therefore contains the reverse complement of the typed sequence, "
+                "and the insert output is the reverse complement of the typed input sequence.",
             )
         insertion_orientation = {
-            "Auto \u2014 strand-aware (forward)": INSERTION_ORIENTATION_AUTO,
             "Force forward": INSERTION_ORIENTATION_FORWARD,
             "Force reverse-complement": INSERTION_ORIENTATION_REVERSE,
+            "Strand-aware (pegRNA/matched-strand orientation)": INSERTION_ORIENTATION_AUTO,
         }[orientation_label]
         with atnick_col:
             insert_at_nick = st.checkbox(
