@@ -334,19 +334,31 @@ def orient_insertion_for_flap(typed_ins_dna: str, strand: str, orientation: str)
     raise ValueError(f"Unknown insertion orientation: {orientation}")
 
 
-def build_addition_homology_rtt(target_seq_dna: str, insert_after_target: int, homology_len: int) -> Optional[dict]:
-    """Addition-mode RTT column = reverse-complement RNA of the 3' homology arm only.
+def orient_edit_for_flap(input_edit_dna: str, strand: str, orientation: str) -> str:
+    """Orient a reference-orientation edit for the pegRNA flap.
 
-    The homology arm is the genomic stretch immediately downstream of the insertion site.
-    The retained genomic (nick -> insertion site) and the insertion itself live in the
-    'insert' column, so that RTT + insert + PBS concatenates into the pegRNA 3' extension.
+    Batch substitution/deletion entries are always typed in input/reference (+)
+    orientation. The edited-DNA output uses the typed sequence as-is; this helper
+    only converts the sequence used to construct the pegRNA insert.
     """
-    if homology_len < 1:
+    edit = re.sub(r"\s+", "", str(input_edit_dna or ""))
+    if not edit:
+        return ""
+    edit = clean_dna(edit)
+    if orientation in (INSERTION_ORIENTATION_AUTO, INSERTION_ORIENTATION_FORWARD):
+        return edit if strand == "+" else revcomp_dna(edit)
+    if orientation == INSERTION_ORIENTATION_REVERSE:
+        return revcomp_dna(edit) if strand == "+" else edit
+    raise ValueError(f"Unknown insertion orientation: {orientation}")
+
+
+def build_addition_homology_rtt_from_start(
+    target_seq_dna: str, homology_start_target: int, homology_len: int
+) -> Optional[dict]:
+    """Build an Addition-mode RTT from an explicit downstream homology start."""
+    if homology_len < 1 or homology_start_target < 0:
         return None
-    downstream_start = insert_after_target + 1
-    if downstream_start < 0:
-        return None
-    homology = target_seq_dna[downstream_start:downstream_start + homology_len]
+    homology = target_seq_dna[homology_start_target:homology_start_target + homology_len]
     if len(homology) != homology_len:
         return None
     rtt_dna = revcomp_dna(homology)
@@ -354,6 +366,13 @@ def build_addition_homology_rtt(target_seq_dna: str, insert_after_target: int, h
         "Sequence": dna_to_rna(rtt_dna),
         "Length": homology_len,
     }
+
+
+def build_addition_homology_rtt(target_seq_dna: str, insert_after_target: int, homology_len: int) -> Optional[dict]:
+    """Build the Addition-mode RTT immediately downstream of an insertion site."""
+    return build_addition_homology_rtt_from_start(
+        target_seq_dna, insert_after_target + 1, homology_len
+    )
 
 
 def pick_tm_optimal_pbs(target_seq_dna: str, nick_target: int) -> tuple[Optional[int], Optional[float]]:
@@ -415,6 +434,9 @@ def design_pbs_rtt(
     addition_mode: bool = False,
     insertion_orientation: str = INSERTION_ORIENTATION_FORWARD,
     insert_at_nick: bool = False,
+    edit_operation: Optional[str] = None,
+    edit_start_target: Optional[int] = None,
+    edit_end_target: Optional[int] = None,
 ) -> DesignResult:
     target_seq, match = get_target_sequence_and_match(
         genomic_seq=genomic_seq,
@@ -422,9 +444,20 @@ def design_pbs_rtt(
         nick_offset=nick_offset,
     )
 
-    insertion_sequence = validate_insertion_sequence(insertion_sequence, allow_empty=not addition_mode)
-    if addition_mode and not insertion_sequence:
-        raise ValueError("Addition (pure insertion) mode requires a non-empty insertion sequence.")
+    if edit_operation is not None:
+        if not addition_mode:
+            raise ValueError("Edit operation mode requires Addition mode.")
+        if edit_operation not in ("substitution", "deletion"):
+            raise ValueError(f"Unknown edit operation: {edit_operation}")
+        if edit_start_target is None or edit_end_target is None:
+            raise ValueError("Edit operation requires both a start and end target position.")
+        insertion_sequence = validate_insertion_sequence(
+            insertion_sequence, allow_empty=(edit_operation == "deletion")
+        )
+    else:
+        insertion_sequence = validate_insertion_sequence(insertion_sequence, allow_empty=not addition_mode)
+        if addition_mode and not insertion_sequence:
+            raise ValueError("Addition (pure insertion) mode requires a non-empty insertion sequence.")
 
     pbs_lengths, default_pbs_len, default_pbs_tm = pbs_lengths_from_mode(
         target_seq_dna=target_seq,
@@ -443,20 +476,30 @@ def design_pbs_rtt(
     # Resolve the site.
     #  - legacy mode: first base included in RTT.
     #  - addition mode: the base AFTER which the insertion is placed.
-    if rtt_start_mode == "nick":
-        effective_site_target = match.nick_target
+    #  - edit mode: the target-oriented interval to replace/delete.
+    if edit_operation is not None:
+        edit_start_target = int(edit_start_target)
+        edit_end_target = int(edit_end_target)
+        if not (0 <= edit_start_target <= edit_end_target < len(target_seq)):
+            raise ValueError("Edit interval is outside the target sequence or has start after end.")
+        if edit_start_target < match.nick_target:
+            raise ValueError("Edit interval starts upstream of the nick site in the matched orientation.")
+        effective_site_target = edit_start_target - 1
     else:
-        effective_site_target = match.nick_target if rtt_start_target is None else int(rtt_start_target)
+        if rtt_start_mode == "nick":
+            effective_site_target = match.nick_target
+        else:
+            effective_site_target = match.nick_target if rtt_start_target is None else int(rtt_start_target)
 
-    if addition_mode and insert_at_nick:
-        # Insert right at the nick junction: retain zero genomic bases.
-        effective_site_target = match.nick_target - 1
+        if addition_mode and insert_at_nick:
+            # Insert right at the nick junction: retain zero genomic bases.
+            effective_site_target = match.nick_target - 1
 
-    if not (addition_mode and insert_at_nick):
-        if effective_site_target < match.nick_target:
-            raise ValueError("Selected site must be at or downstream of the nick site in the matched orientation.")
-    if effective_site_target >= len(target_seq):
-        raise ValueError("Selected site is outside the target sequence.")
+        if not (addition_mode and insert_at_nick):
+            if effective_site_target < match.nick_target:
+                raise ValueError("Selected site must be at or downstream of the nick site in the matched orientation.")
+        if effective_site_target >= len(target_seq):
+            raise ValueError("Selected site is outside the target sequence.")
 
     pbs_rows: list[dict] = []
     rtt_rows: list[dict] = []
@@ -475,21 +518,43 @@ def design_pbs_rtt(
     addition_retained_dna: Optional[str] = None
 
     if addition_mode:
-        typed_ins_dna = clean_dna(insertion_sequence)
-        ins_flap = orient_insertion_for_flap(typed_ins_dna, match.strand, insertion_orientation)
-        # Retained genomic (matched-strand orientation) from the nick up to and including the site.
-        retained = target_seq[match.nick_target:effective_site_target + 1]
-        addition_retained_dna = retained
-        # 'insert' column = reverse-complement RNA of (retained + insertion), so that
-        # RTT (revcomp homology) + insert + PBS = the pegRNA 3' extension (5'->3').
-        insert_region_dna = retained + ins_flap
-        addition_insert_rna = dna_to_rna(revcomp_dna(insert_region_dna))
-        for homology_len in rtt_lengths:
-            candidate = build_addition_homology_rtt(target_seq, effective_site_target, homology_len)
-            if candidate is None:
-                skipped_rtt.append(homology_len)
-            else:
-                rtt_rows.append(candidate)
+        if edit_operation is not None:
+            # Edit sequences are typed in input/reference orientation. Convert only
+            # the pegRNA flap segment to matched-strand orientation.
+            replacement = orient_edit_for_flap(
+                insertion_sequence, match.strand, insertion_orientation
+            )
+            retained = target_seq[match.nick_target:edit_start_target]
+            addition_retained_dna = retained
+            insert_region_dna = retained + replacement
+            addition_insert_rna = (
+                dna_to_rna(revcomp_dna(insert_region_dna)) if insert_region_dna else ""
+            )
+            homology_start_target = edit_end_target + 1
+            for homology_len in rtt_lengths:
+                candidate = build_addition_homology_rtt_from_start(
+                    target_seq, homology_start_target, homology_len
+                )
+                if candidate is None:
+                    skipped_rtt.append(homology_len)
+                else:
+                    rtt_rows.append(candidate)
+        else:
+            typed_ins_dna = clean_dna(insertion_sequence)
+            ins_flap = orient_insertion_for_flap(typed_ins_dna, match.strand, insertion_orientation)
+            # Retained genomic (matched-strand orientation) from the nick up to and including the site.
+            retained = target_seq[match.nick_target:effective_site_target + 1]
+            addition_retained_dna = retained
+            # 'insert' column = reverse-complement RNA of (retained + insertion), so that
+            # RTT (revcomp homology) + insert + PBS = the pegRNA 3' extension (5'->3').
+            insert_region_dna = retained + ins_flap
+            addition_insert_rna = dna_to_rna(revcomp_dna(insert_region_dna))
+            for homology_len in rtt_lengths:
+                candidate = build_addition_homology_rtt(target_seq, effective_site_target, homology_len)
+                if candidate is None:
+                    skipped_rtt.append(homology_len)
+                else:
+                    rtt_rows.append(candidate)
     else:
         for rtt_len in rtt_lengths:
             candidate = build_rtt_candidate(target_seq, effective_site_target, rtt_len)
@@ -502,6 +567,8 @@ def design_pbs_rtt(
         raise ValueError("None of the requested PBS lengths could be generated at this nick site.")
     if not rtt_rows:
         if addition_mode:
+            if edit_operation is not None:
+                raise ValueError("None of the requested homology-arm lengths fit downstream of the edit interval.")
             raise ValueError("None of the requested homology-arm lengths fit downstream of the insertion site.")
         raise ValueError("None of the requested RTT lengths could be generated at this RTT start site.")
 
@@ -509,7 +576,8 @@ def design_pbs_rtt(
         warnings.append("Skipped PBS lengths outside sequence bounds at this nick site: " + ", ".join(map(str, skipped_pbs)))
     if skipped_rtt:
         if addition_mode:
-            warnings.append("Skipped homology-arm lengths that run past the end of the sequence downstream of the insertion site: " + ", ".join(map(str, skipped_rtt)))
+            downstream_label = "edit interval" if edit_operation is not None else "insertion site"
+            warnings.append("Skipped homology-arm lengths that run past the end of the sequence downstream of the " + downstream_label + ": " + ", ".join(map(str, skipped_rtt)))
         else:
             warnings.append("Skipped RTT lengths outside sequence bounds at this RTT start site: " + ", ".join(map(str, skipped_rtt)))
 
@@ -543,25 +611,36 @@ def design_pbs_rtt(
         ]
         rtt_insert_pbs_text = format_delimited_rows(rtt_insert_pbs_rows)
 
-    summary_line = f"Spacer matching strand: {match.strand}; Default PBS: {default_pbs_len} nt, Tm = {round(float(default_pbs_tm), 2)} \u00b0C"
+    summary_line = f"Spacer matching strand: {match.strand}; Default PBS: {default_pbs_len} nt, Tm = {round(float(default_pbs_tm), 2)} °C"
     if addition_mode:
-        if insert_at_nick or effective_site_target < match.nick_target:
-            site_desc = "at the nick junction (0 retained bases)"
-        else:
-            offset = effective_site_target - match.nick_target
-            site_desc = f"after site +{offset} (base '{target_seq[effective_site_target]}')"
         orient_desc = {
-            INSERTION_ORIENTATION_AUTO: "strand-aware (pegRNA/matched-strand orientation)",
-            INSERTION_ORIENTATION_FORWARD: "forced forward in input DNA",
-            INSERTION_ORIENTATION_REVERSE: "forced reverse-complement in input DNA",
+            INSERTION_ORIENTATION_AUTO: "strand-aware pegRNA flap orientation",
+            INSERTION_ORIENTATION_FORWARD: "reference-to-pegRNA orientation",
+            INSERTION_ORIENTATION_REVERSE: "reverse-complement pegRNA orientation",
         }.get(insertion_orientation, insertion_orientation)
-        summary_line += (
-            f"; Mode: Addition (pure insertion) on the {match.strand} strand \u2014 "
-            f"{len(clean_dna(insertion_sequence))} nt inserted {site_desc}; "
-            f"orientation: {orient_desc}. RTT column = reverse-complement RNA of the 3\u2032 homology arm; "
-            f"insert (revcomp of retained+insertion) = {addition_insert_rna}. "
-            f"RTT + insert + PBS = pegRNA 3\u2032 extension."
-        )
+        if edit_operation is not None:
+            summary_line += (
+                f"; Mode: {edit_operation} on the {match.strand} strand — "
+                f"target positions {edit_start_target + 1}-{edit_end_target + 1} (inclusive); "
+                f"replacement length: {len(insertion_sequence)} nt; "
+                f"orientation applied only to pegRNA insert: {orient_desc}. "
+                f"RTT column = reverse-complement RNA of downstream homology; "
+                f"insert (revcomp of retained+edit) = {addition_insert_rna}. "
+                f"RTT + insert + PBS = pegRNA 3′ extension."
+            )
+        else:
+            if insert_at_nick or effective_site_target < match.nick_target:
+                site_desc = "at the nick junction (0 retained bases)"
+            else:
+                offset = effective_site_target - match.nick_target
+                site_desc = f"after site +{offset} (base '{target_seq[effective_site_target]}')"
+            summary_line += (
+                f"; Mode: Addition (pure insertion) on the {match.strand} strand — "
+                f"{len(clean_dna(insertion_sequence))} nt inserted {site_desc}; "
+                f"orientation: {orient_desc}. RTT column = reverse-complement RNA of the 3′ homology arm; "
+                f"insert (revcomp of retained+insertion) = {addition_insert_rna}. "
+                f"RTT + insert + PBS = pegRNA 3′ extension."
+            )
 
     return DesignResult(
         match=match,
@@ -585,6 +664,213 @@ def design_pbs_rtt(
 
 
 # ---------------------------------------------------------------------------
+# Batch substitution/deletion mode
+# ---------------------------------------------------------------------------
+
+QWC_HALF_WINDOW = 22
+
+BATCH_EDIT_SUBSTITUTION = "substitution"
+BATCH_EDIT_DELETION = "deletion"
+
+BATCH_EDIT_COLUMNS = [
+    "spacer ID",
+    "spacer seq",
+    "edit ID",
+    "edit seq",
+    "Edit_Type",
+    "Edit_Region",
+    "RTT",
+    "insert",
+    "PBS",
+    "3\' ext",
+    "input DNA",
+    "edited DNA",
+    "Quantification_Window_Coordinates",
+    "Edit_Method",
+]
+
+
+def parse_batch_edit_table(text: str) -> list[tuple[str, str, str]]:
+    """Parse mixed edits; IDs ``deletion`` and ``del`` mean deletion.
+
+    Matching is exact and case-insensitive. Every other ID is a substitution
+    and requires a replacement sequence in input/reference orientation.
+    """
+    rows: list[tuple[str, str, str]] = []
+    seen_ids: set[str] = set()
+    for lineno, raw in enumerate(str(text or "").splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [p for p in re.split(r"[\t,]+|\s{2,}|\s+", line) if p]
+        entry_id = parts[0].strip() if parts else ""
+        if not entry_id:
+            raise ValueError(f"Edit line {lineno} is missing an ID.")
+        if entry_id in seen_ids:
+            raise ValueError(f"Edits have a duplicate ID: {entry_id}")
+        operation = (
+            BATCH_EDIT_DELETION
+            if entry_id.casefold() in {"deletion", "del"}
+            else BATCH_EDIT_SUBSTITUTION
+        )
+        if operation == BATCH_EDIT_DELETION:
+            if len(parts) > 1:
+                raise ValueError(
+                    f"Deletion ID {entry_id!r} on line {lineno} must not include a sequence; "
+                    "the selected region is removed."
+                )
+            seq = ""
+        else:
+            if len(parts) < 2:
+                raise ValueError(
+                    f"Substitution line {lineno} needs ID and replacement sequence: {raw!r}"
+                )
+            seq = clean_dna("".join(parts[1:]))
+        seen_ids.add(entry_id)
+        rows.append((entry_id, seq, operation))
+    if not rows:
+        raise ValueError("No valid substitution/deletion entries were provided.")
+    return rows
+
+
+def _batch_edit_target_interval(
+    match: SpacerMatch, seq_len: int, start_1based: int, end_1based: int
+) -> Optional[dict]:
+    """Map a plus-oriented inclusive edit interval into matched target coordinates."""
+    start = int(start_1based)
+    end = int(end_1based)
+    if start < 1 or end < 1 or start > end or end > seq_len:
+        raise ValueError(
+            f"Edit interval must satisfy 1 <= start <= end <= {seq_len} (got {start}-{end})."
+        )
+    if match.strand == "+":
+        edit_start_target = start - 1
+        edit_end_target = end - 1
+    else:
+        edit_start_target = seq_len - end
+        edit_end_target = seq_len - start
+    if edit_start_target < match.nick_target:
+        return None
+    return {
+        "edit_start_target": edit_start_target,
+        "edit_end_target": edit_end_target,
+        "edit_start_plus": start - 1,
+        "edit_end_plus": end,
+    }
+
+
+def design_batch_substitution_deletion(
+    genomic_seq: str,
+    spacers: list[tuple[str, str]],
+    edits: list[tuple[str, str, str]],
+    start_1based: int,
+    end_1based: int,
+    nick_offset: int = 3,
+    pbs_shorter: int = 0,
+    pbs_longer: int = 0,
+    rtt_mode: str = "range",
+    rtt_manual_lengths: str = "",
+    rtt_min: int = 10,
+    rtt_max: int = 20,
+    rtt_count: int = 3,
+    insertion_orientation: str = INSERTION_ORIENTATION_AUTO,
+    qwc_half: int = QWC_HALF_WINDOW,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Enumerate pegRNA designs for every spacer × mixed edit entry."""
+    input_dna = clean_dna(genomic_seq)
+    seq_len = len(input_dna)
+    start = int(start_1based)
+    end = int(end_1based)
+    if start < 1 or start > end or end > seq_len:
+        raise ValueError(
+            f"Edit interval must satisfy 1 <= start <= end <= {seq_len} (got {start}-{end})."
+        )
+    warnings: list[str] = []
+    out_rows: list[dict] = []
+
+    for spacer_id, spacer_seq in spacers:
+        try:
+            matches = find_spacer_matches(input_dna, spacer_seq, nick_offset=nick_offset)
+        except ValueError as exc:
+            warnings.append(f"[{spacer_id}] invalid spacer skipped: {exc}")
+            continue
+        if len(matches) == 0:
+            warnings.append(f"[{spacer_id}] not found in the input DNA on either strand - all combinations skipped.")
+            continue
+        if len(matches) > 1:
+            sites = "; ".join(f"{m.strand} strand @ {m.spacer_start_plus + 1}" for m in matches[:6])
+            warnings.append(f"[{spacer_id}] matched {len(matches)} sites ({sites}) - ambiguous, all combinations skipped.")
+            continue
+        match = matches[0]
+        interval = _batch_edit_target_interval(match, seq_len, start, end)
+        if interval is None:
+            side = "downstream (higher position)" if match.strand == "+" else "downstream (lower position)"
+            warnings.append(
+                f"[{spacer_id}] edit interval {start}-{end} starts upstream of the nick "
+                f"at input-DNA index {match.nick_plus}; this spacer extends {side} - skipped."
+            )
+            continue
+        qwc = quantification_window_coordinates(match.nick_plus, seq_len, half=qwc_half)
+
+        for edit_id, edit_seq, edit_operation in edits:
+            try:
+                result = design_pbs_rtt(
+                    genomic_seq=input_dna,
+                    spacer=spacer_seq,
+                    nick_offset=nick_offset,
+                    pbs_shorter=pbs_shorter,
+                    pbs_longer=pbs_longer,
+                    rtt_mode=rtt_mode,
+                    rtt_manual_lengths=rtt_manual_lengths,
+                    rtt_min=rtt_min,
+                    rtt_max=rtt_max,
+                    rtt_count=rtt_count,
+                    rtt_start_mode="selected",
+                    rtt_start_target=interval["edit_start_target"],
+                    include_insertion=False,
+                    insertion_sequence=edit_seq,
+                    addition_mode=True,
+                    insertion_orientation=insertion_orientation,
+                    edit_operation=edit_operation,
+                    edit_start_target=interval["edit_start_target"],
+                    edit_end_target=interval["edit_end_target"],
+                )
+            except ValueError as exc:
+                warnings.append(f"[{spacer_id} x {edit_id}] skipped: {exc}")
+                continue
+
+            if edit_operation == BATCH_EDIT_SUBSTITUTION:
+                edited_dna = input_dna[:start - 1] + edit_seq + input_dna[end:]
+                method = "Substitution"
+            else:
+                edited_dna = input_dna[:start - 1] + input_dna[end:]
+                method = "Deletion"
+
+            rtt_sequences = result.rtt_df.sort_values(["Length", "Sequence"])["Sequence"].tolist()
+            pbs_sequences = result.pbs_df.sort_values(["Length", "Sequence"])["Sequence"].tolist()
+            for rtt_seq in rtt_sequences:
+                for pbs_seq in pbs_sequences:
+                    out_rows.append({
+                        "spacer ID": spacer_id,
+                        "spacer seq": spacer_seq,
+                        "edit ID": edit_id,
+                        "edit seq": edit_seq,
+                        "Edit_Type": edit_operation,
+                        "Edit_Region": f"{start}-{end}",
+                        "RTT": rtt_seq,
+                        "insert": result.addition_insert_rna or "",
+                        "PBS": pbs_seq,
+                        "3\' ext": f"{rtt_seq}{result.addition_insert_rna or ''}{pbs_seq}",
+                        "input DNA": input_dna,
+                        "edited DNA": edited_dna,
+                        "Quantification_Window_Coordinates": qwc,
+                        "Edit_Method": method,
+                    })
+
+    return pd.DataFrame(out_rows, columns=BATCH_EDIT_COLUMNS), warnings
+
+
+# ---------------------------------------------------------------------------
 # Batch pure-insertion mode
 # ---------------------------------------------------------------------------
 
@@ -602,6 +888,7 @@ BATCH_COLUMNS = [
     "RTT",
     "insert",
     "PBS",
+    "3\' ext",
     "input DNA",
     "edited DNA",
     "Quantification_Window_Coordinates",
@@ -864,6 +1151,7 @@ def design_batch_insertion(
                         "RTT": rtt_seq,
                         "insert": insert_rna,
                         "PBS": pbs_seq,
+                        "3\' ext": f"{rtt_seq}{insert_rna or ''}{pbs_seq}",
                         "input DNA": input_dna,
                         "edited DNA": edited_dna,
                         "Quantification_Window_Coordinates": qwc,

@@ -15,7 +15,9 @@ from pbs_rtt_designer_core import (
     INSERTION_ORIENTATION_REVERSE,
     build_rtt_start_selector,
     design_batch_insertion,
+    design_batch_substitution_deletion,
     design_pbs_rtt,
+    parse_batch_edit_table,
     parse_two_column_table,
     validate_insertion_sequence,
 )
@@ -206,6 +208,182 @@ def render_rtt_start_selector(selector, signature: str, show_buttons: bool = Tru
             st.caption("RTT start is locked to the nick site in this mode.")
     return int(st.session_state.get("selected_rtt_start_target", selected_target))
 
+
+
+def render_batch_edit_mode() -> None:
+    st.markdown("## Batch substitution/deletion designer")
+    st.caption(
+        "Enter spacers and substitution/deletion IDs. One inclusive 1-based DNA interval is "
+        "applied to every spacer × edit combination. Substitutions replace the interval; "
+        "deletions remove it. RTT, pegRNA insert, and PBS combinations are expanded in the output."
+    )
+
+    genomic_seq = st.text_area(
+        "Input DNA (amplicon / reference)",
+        height=150,
+        placeholder="Paste the reference DNA (A/C/G/T; U accepted and converted to T).",
+        key="batch_edit_input_dna",
+    )
+    seq_len_for_ui = max(1, len("".join(genomic_seq.split())))
+
+    col_sp, col_edit = st.columns(2)
+    with col_sp:
+        spacers_text = st.text_area(
+            "Spacers — ID <tab/space/comma> sequence, one per line",
+            height=170,
+            value=(
+                "c9sg066\tGCAGCGGCCGGGGCTGGCCACC\n"
+                "c9sg068\tCTGGCAGCAGCGGCCGGGGCTG\n"
+                "c9sg069\tTGCTGGGTAGAGGTGGCCAGCC"
+            ),
+            key="batch_edit_spacers",
+        )
+    with col_edit:
+        edit_text_col, edit_help_col = st.columns([8, 1])
+        with edit_text_col:
+            edit_text = st.text_area(
+                "Substitutions or deletions — ID <tab/space/comma> sequence, one per line",
+                height=170,
+                value="kozak\tGCCACC\ndeletion",
+                key="batch_edit_entries",
+            )
+        with edit_help_col:
+            with st.popover("?"):
+                st.write(
+                    "Each line is an ID followed by an optional sequence. "
+                    "IDs exactly equal to deletion or del (case-insensitive) mean deletion; "
+                    "do not enter a sequence for those rows. Any other ID means substitution "
+                    "and requires the replacement sequence in input/reference (+) orientation."
+                )
+                st.write("Examples:")
+                st.code("kozak\tGCCACC\ndeLete", language=None)
+
+
+    region_col, nick_col = st.columns([6, 4])
+    with region_col:
+        st.markdown("### Edit region")
+        start_1based = st.number_input(
+            "Start position (1-based, inclusive)",
+            min_value=1,
+            max_value=seq_len_for_ui,
+            value=1,
+            step=1,
+            key="batch_edit_start",
+        )
+        end_1based = st.number_input(
+            "End position (1-based, inclusive)",
+            min_value=1,
+            max_value=seq_len_for_ui,
+            value=1,
+            step=1,
+            key="batch_edit_end",
+        )
+        st.caption(
+            "Example: input TTGGGAA, region 2–4, substitution CC → TCCGAA; "
+            "deletion → TGAA. Start must be ≤ end."
+        )
+    with nick_col:
+        st.markdown("### Nick offset")
+        nick_offset = st.number_input(
+            "Nick offset",
+            min_value=0,
+            max_value=50,
+            value=3,
+            key="batch_edit_nick_offset",
+            help="Nick placed this many nt upstream of the spacer 3′ end in matched orientation.",
+        )
+
+    st.markdown("### PBS & RTT (3′ homology arm) settings")
+    pcol1, pcol2 = st.columns(2)
+    with pcol1:
+        pbs_shorter = st.slider("Include shorter PBS lengths", 0, 20, 0, key="batch_edit_pbs_short")
+    with pcol2:
+        pbs_longer = st.slider("Include longer PBS lengths", 0, 20, 0, key="batch_edit_pbs_long")
+
+    rmode_col, r1, r2, r3 = st.columns([3, 2, 2, 2])
+    with rmode_col:
+        rtt_mode_label = st.radio(
+            "RTT / homology-arm lengths",
+            options=["Min / max / count", "Manual exact lengths"],
+            index=0,
+            key="batch_edit_rtt_mode",
+        )
+    rtt_mode = "range" if rtt_mode_label == "Min / max / count" else "manual"
+    rtt_manual_lengths = ""
+    rtt_min, rtt_max, rtt_count = 10, 20, 3
+    if rtt_mode == "range":
+        with r1:
+            rtt_min = st.number_input("Arm min", 1, 500, 10, key="batch_edit_rtt_min")
+        with r2:
+            rtt_max = st.number_input("Arm max", 1, 500, 20, key="batch_edit_rtt_max")
+        with r3:
+            rtt_count = st.number_input("How many", 2, 100, 3, key="batch_edit_rtt_count")
+    else:
+        with r1:
+            rtt_manual_lengths = st.text_input(
+                "Manual arm lengths",
+                value="10,15,20",
+                key="batch_edit_rtt_manual",
+                help="Comma- or space-separated homology-arm lengths.",
+            )
+
+    run = st.button("Run batch substitution/deletion design", type="primary", width="stretch")
+    if not run:
+        return
+    if not genomic_seq.strip():
+        st.error("Please paste the input DNA.")
+        return
+    if int(start_1based) > int(end_1based):
+        st.error("Start position must be less than or equal to end position.")
+        return
+
+    try:
+        spacers = parse_two_column_table(spacers_text, "Spacers", validate_dna=True)
+        edits = parse_batch_edit_table(edit_text)
+    except Exception as exc:
+        st.error(str(exc))
+        return
+
+    try:
+        df, batch_warnings = design_batch_substitution_deletion(
+            genomic_seq=genomic_seq,
+            spacers=spacers,
+            edits=edits,
+            start_1based=int(start_1based),
+            end_1based=int(end_1based),
+            nick_offset=int(nick_offset),
+            pbs_shorter=int(pbs_shorter),
+            pbs_longer=int(pbs_longer),
+            rtt_mode=rtt_mode,
+            rtt_manual_lengths=rtt_manual_lengths,
+            rtt_min=int(rtt_min),
+            rtt_max=int(rtt_max),
+            rtt_count=int(rtt_count),
+        )
+    except Exception as exc:
+        st.error(str(exc))
+        return
+
+    for warning in batch_warnings:
+        st.warning(warning)
+    if df.empty:
+        st.info("No valid designs were produced — see the warnings above.")
+        return
+
+    st.success(
+        f"Generated {len(df)} row(s) across {df['spacer ID'].nunique()} spacer(s) "
+        f"and {df['edit ID'].nunique()} edit(s)."
+    )
+    st.dataframe(df, width="stretch", hide_index=True)
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download CSV",
+        data=csv_bytes,
+        file_name="batch_pegRNA_substitution_deletion_designs.csv",
+        mime="text/csv",
+        type="primary",
+        width="stretch",
+    )
 
 
 def render_batch_mode() -> None:
@@ -420,12 +598,15 @@ def render_batch_mode() -> None:
 
 app_mode = st.radio(
     "Tool mode",
-    options=["Single design", "Batch pure-insertion"],
+    options=["Single design", "Batch substitution/deletion", "Batch pure-insertion"],
     index=0,
     horizontal=True,
     key="app_mode",
 )
 
+if app_mode == "Batch substitution/deletion":
+    render_batch_edit_mode()
+    st.stop()
 if app_mode == "Batch pure-insertion":
     render_batch_mode()
     st.stop()
